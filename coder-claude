@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKSPACE="${1:?Usage: coder-claude <workspace-name>}"
+PRESET="${2:-us-west-2}"
+WORKDIR="/home/ubuntu/figma/figma"
+AGENT="${WORKSPACE}.devcontainer"
+
+# Create workspace if it doesn't exist, otherwise start/update it
+if coder list 2>/dev/null | grep -q "$WORKSPACE"; then
+  # Check if workspace is outdated (template version changed)
+  if coder list 2>/dev/null | grep "$WORKSPACE" | grep -q "true"; then
+    echo "Workspace ${WORKSPACE} is outdated, updating template..."
+    coder update "$WORKSPACE" --parameter 'jetbrains_ides=[]'
+  else
+    echo "Starting workspace ${WORKSPACE}..."
+    coder start "$WORKSPACE" --yes 2>/dev/null || true
+  fi
+else
+  echo "Creating workspace ${WORKSPACE} (preset: ${PRESET})..."
+  coder create "$WORKSPACE" --template devbox --preset "$PRESET" --yes \
+    --parameter jetbrains_ides='[]' \
+    --parameter git_branch=master \
+    --parameter show_advanced=false \
+    --parameter lightweight_mode=false
+fi
+
+# Wait for the devcontainer agent — it starts after the workspace agent
+echo "Waiting for devcontainer agent..."
+for i in $(seq 1 60); do
+  if coder ping "$AGENT" -n 1 --timeout 5s 2>/dev/null; then
+    break
+  fi
+  if [ "$i" -eq 60 ]; then
+    echo "Timed out waiting for devcontainer agent"
+    exit 1
+  fi
+  printf "."
+  sleep 5
+done
+echo ""
+
+# Pre-seed Claude config to skip all first-run prompts (onboarding, trust, theme, cost)
+# and set default model to opus[1m]
+echo "Configuring Claude Code..."
+coder ssh "$AGENT" --wait yes -- bash -c "$(cat <<'REMOTESCRIPT'
+WORKDIR="/home/ubuntu/figma/figma"
+CLAUDE_CONFIG="$HOME/.claude.json"
+CLAUDE_SETTINGS_DIR="$HOME/.claude"
+CLAUDE_SETTINGS="$CLAUDE_SETTINGS_DIR/settings.json"
+
+mkdir -p "$CLAUDE_SETTINGS_DIR"
+
+# Ensure settings.json has the model set to opus[1m]
+if [ -f "$CLAUDE_SETTINGS" ] && command -v jq &>/dev/null; then
+  jq '.model = "opus[1m]"' "$CLAUDE_SETTINGS" > "${CLAUDE_SETTINGS}.tmp" && mv "${CLAUDE_SETTINGS}.tmp" "$CLAUDE_SETTINGS"
+else
+  cat > "$CLAUDE_SETTINGS" << 'SETTINGSEOF'
+{
+  "model": "opus[1m]"
+}
+SETTINGSEOF
+fi
+echo "Set model to opus[1m]"
+
+# Write .claude.json to skip all onboarding/trust prompts
+if [ ! -f "$CLAUDE_CONFIG" ]; then
+  cat > "$CLAUDE_CONFIG" << JSONEOF
+{
+  "numStartups": 1,
+  "autoUpdaterStatus": "disabled",
+  "bypassPermissionsModeAccepted": true,
+  "hasAcknowledgedCostThreshold": true,
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "1.0.25",
+  "theme": "dark",
+  "projects": {
+    "$WORKDIR": {
+      "allowedTools": [],
+      "mcpServers": {},
+      "hasTrustDialogAccepted": true,
+      "hasCompletedProjectOnboarding": true,
+      "projectOnboardingSeenCount": 1
+    }
+  }
+}
+JSONEOF
+  echo "Created Claude config"
+else
+  if command -v jq &>/dev/null; then
+    jq --arg workdir "$WORKDIR" \
+      '.autoUpdaterStatus = "disabled" |
+       .bypassPermissionsModeAccepted = true |
+       .hasAcknowledgedCostThreshold = true |
+       .hasCompletedOnboarding = true |
+       .lastOnboardingVersion = "1.0.25" |
+       .theme //= "dark" |
+       .projects[$workdir].allowedTools //= [] |
+       .projects[$workdir].hasTrustDialogAccepted = true |
+       .projects[$workdir].hasCompletedProjectOnboarding = true |
+       .projects[$workdir].projectOnboardingSeenCount = 1' \
+      "$CLAUDE_CONFIG" > "${CLAUDE_CONFIG}.tmp" && mv "${CLAUDE_CONFIG}.tmp" "$CLAUDE_CONFIG"
+    echo "Updated Claude config"
+  fi
+fi
+REMOTESCRIPT
+)"
+
+# Enable tmux mouse mode so scrolling works properly
+coder ssh "$AGENT" --wait yes -- bash -c '
+grep -q "mouse on" ~/.tmux.conf 2>/dev/null || echo "set -g mouse on" >> ~/.tmux.conf
+grep -q "extended-keys on" ~/.tmux.conf 2>/dev/null || echo "set -s extended-keys on" >> ~/.tmux.conf
+grep -q "extended-keys-format csi-u" ~/.tmux.conf 2>/dev/null || echo "set -s extended-keys-format csi-u" >> ~/.tmux.conf
+'
+
+# SSH in with tmux — run claude, and drop to shell when it exits
+echo "Connecting..."
+REMOTE_CMD="cd ${WORKDIR} && exec tmux new-session -A -s ${WORKSPACE} 'claude --dangerously-skip-permissions; exec bash -l'"
+coder ssh "$AGENT" --wait yes -- bash -lc "$REMOTE_CMD"
