@@ -113,6 +113,9 @@ grep -q "extended-keys on" ~/.tmux.conf 2>/dev/null || echo "set -s extended-key
 grep -q "extended-keys-format csi-u" ~/.tmux.conf 2>/dev/null || echo "set -s extended-keys-format csi-u" >> ~/.tmux.conf
 '
 
+# Set terminal tab title to workspace name
+echo -e "\033]0;${WORKSPACE}\007"
+
 # SSH in with tmux — run claude, and drop to shell when it exits
 echo "Connecting..."
 REMOTE_CMD="cd ${WORKDIR} && exec tmux new-session -A -s ${WORKSPACE} 'claude --dangerously-skip-permissions; exec bash -l'"
