@@ -7,14 +7,25 @@ WORKDIR="/home/ubuntu/figma/figma"
 AGENT="${WORKSPACE}.devcontainer"
 
 # Create workspace if it doesn't exist, otherwise start/update it
-if coder list 2>/dev/null | grep -q "$WORKSPACE"; then
-  # Check if workspace is outdated (template version changed)
-  if coder list 2>/dev/null | grep "$WORKSPACE" | grep -q "true"; then
+# Use temp file + tr to strip control chars that coder emits in JSON script fields
+WS_FILE=$(mktemp)
+trap 'rm -f "$WS_FILE"' EXIT
+coder list -o json 2>/dev/null | tr -d '\000-\010\016-\037' >"$WS_FILE" || echo "[]" >"$WS_FILE"
+WS_INFO=$(jq -r --arg ws "$WORKSPACE" \
+  '.[] | select(.name == $ws) | "\(.outdated)|\(.latest_build.status)"' \
+  "$WS_FILE" 2>/dev/null) || true
+
+if [ -n "$WS_INFO" ]; then
+  OUTDATED="${WS_INFO%%|*}"
+  STATUS="${WS_INFO#*|}"
+  if [ "$OUTDATED" = "true" ]; then
     echo "Workspace ${WORKSPACE} is outdated, updating template..."
     coder update "$WORKSPACE" --parameter 'jetbrains_ides=[]'
-  else
+  elif [ "$STATUS" != "running" ]; then
     echo "Starting workspace ${WORKSPACE}..."
     coder start "$WORKSPACE" --yes 2>/dev/null || true
+  else
+    echo "Workspace ${WORKSPACE} is already running."
   fi
 else
   echo "Creating workspace ${WORKSPACE} (preset: ${PRESET})..."
